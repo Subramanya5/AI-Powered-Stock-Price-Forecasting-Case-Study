@@ -1,0 +1,365 @@
+# ================================
+#  Required Imports
+# ================================
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import yfinance as yf
+from datetime import datetime, timedelta
+import pandas_market_calendars as mcal
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import adfuller
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import MinMaxScaler
+from keras.models import Sequential
+from keras.layers import LSTM, Dense, GRU
+from xgboost import XGBRegressor
+from prophet import Prophet
+from catboost import CatBoostRegressor
+import yfinance as yf
+import pandas as pd
+
+from datetime import datetime, timedelta
+import pandas_market_calendars as mcal
+
+# ================================
+#  Get last market open date using NSE calendar
+# ================================
+print("For NSE stocks, use '.NS' suffix (e.g., RELIANCE.NS, ICICIBANK.NS)")
+stock_symbol = input("Enter the stock symbol: ").strip()
+
+try:
+    nse = mcal.get_calendar('NSE')
+    today = datetime.now()
+    schedule = nse.schedule(start_date=today - timedelta(days=7), end_date=today)
+    last_open_date = schedule.market_close.max().date()
+except Exception:
+    print("Could not fetch NSE calendar. Using today's date as fallback.")
+    last_open_date = datetime.now().date()
+
+start_date = last_open_date - timedelta(days=365 * 10)
+
+# ================================
+#  Begin Forecasting Pipeline
+# ================================
+df = yf.download(stock_symbol, start=start_date.strftime('%Y-%m-%d'), end=last_open_date.strftime('%Y-%m-%d'))
+print(df.head())
+if df.empty:
+    print(f"\nNo data found for '{stock_symbol}'. Please check the symbol and try again.")
+    exit()
+else:
+    df.reset_index(inplace=True)
+    df.dropna(inplace=True)
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ['_'.join(col) if isinstance(col, tuple) else col for col in df.columns]
+
+    date_col = next((col for col in df.columns if 'date' in col.lower()), None)
+    if not date_col:
+        print("Could not find a valid date column. Available columns:", df.columns.tolist())
+        exit()
+
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df.dropna(subset=[date_col], inplace=True)
+    df.sort_values(date_col, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    df['year'] = df[date_col].dt.year
+    df['month'] = df[date_col].dt.month
+    df['day'] = df[date_col].dt.day
+    df['dayofweek'] = df[date_col].dt.dayofweek
+    df['is_month_end'] = df[date_col].dt.is_month_end
+    df['is_month_start'] = df[date_col].dt.is_month_start
+    df['weekofyear'] = df[date_col].dt.isocalendar().week
+
+    df.set_index(date_col, inplace=True)
+
+    print(f"\nDownloaded {len(df)} rows of data for {stock_symbol} from {start_date} to {last_open_date}")
+    print("Data ready for forecasting. Columns:", df.columns.tolist())
+    print(df.head())
+if df is None or df.empty:
+    print(f"\nNo data found for '{stock_symbol}'. Please check the symbol and try again.")
+    exit()
+
+df.reset_index(inplace=True)
+
+if isinstance(df.columns, pd.MultiIndex):
+    df.columns = ['_'.join(col).strip() if isinstance(col, tuple) else col for col in df.columns]
+
+date_col = next((col for col in df.columns if isinstance(col, str) and 'date' in col.lower()), None)
+
+if date_col:
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df.dropna(subset=[date_col], inplace=True)
+    df.sort_values(date_col, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df['year'] = df[date_col].dt.year
+    df['month'] = df[date_col].dt.month
+    print(f"\nDownloaded {len(df)} rows of data for {stock_symbol} from {start_date} to {last_open_date}")
+    print(df.head())
+else:
+    print("Could not find a valid datetime column.")
+    print("Available columns:", df.columns.tolist())
+    exit()
+
+close_col = next((col for col in df.columns if 'close' in col.lower()), None)
+
+if not close_col:
+    print("Close column not found. Available columns:", df.columns.tolist())
+    exit()
+
+df.rename(columns={close_col: 'close'}, inplace=True)
+date_col = next((col for col in df.columns if isinstance(col, str) and 'date' in col.lower()), None)
+
+if not date_col:
+    if df.index.name and 'date' in df.index.name.lower():
+        df.reset_index(inplace=True)
+        date_col = df.columns[0]
+    else:
+        print("No valid date column found.")
+        print("Available columns:", df.columns.tolist())
+        exit()
+
+df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+df.dropna(subset=[date_col], inplace=True)
+df.sort_values(date_col, inplace=True)
+df.reset_index(drop=True, inplace=True)
+df.rename(columns={date_col: 'date'}, inplace=True)
+df['year'] = df['date'].dt.year
+def standardize_date_column(df):
+    date_col = next((col for col in df.columns if isinstance(col, str) and 'date' in col.lower()), None)
+    if not date_col:
+        if df.index.name and 'date' in df.index.name.lower():
+            df.reset_index(inplace=True)
+            date_col = df.columns[0]
+        else:
+            raise KeyError("No valid date column found.")
+    df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+    df.dropna(subset=[date_col], inplace=True)
+    df.sort_values(date_col, inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df.rename(columns={date_col: 'date'}, inplace=True)
+    return df
+expected_features = ['low', 'high', 'volume']
+missing = [col for col in expected_features if col not in df.columns]
+if missing:
+    print(f"Missing columns: {missing}")
+    for col in missing:
+        df[col] = 0.0
+expected_features = ['open', 'high', 'low', 'volume', 'close']
+missing = [col for col in expected_features if col not in df.columns]
+if missing:
+    print(f"Missing columns: {missing}")
+    for col in missing:
+        df[col] = 0.0
+required_columns = ['open', 'high', 'low', 'volume', 'close']
+missing_columns = [col for col in required_columns if col not in df.columns]
+
+if missing_columns:
+    print(f"Missing columns: {missing_columns}")
+    for col in missing_columns:
+        df[col] = 0.0
+for col in missing_columns:
+    df[col] = np.nan
+
+df.fillna(method='ffill', inplace=True)
+df.fillna(method='bfill', inplace=True)
+
+df['year'] = df['date'].dt.year
+df['month'] = df['date'].dt.month
+features = ['low', 'high', 'volume']
+X = df[features]
+y = df['close']
+
+# ================================
+#  Linear Regression
+# ================================
+model_lr = LinearRegression()
+model_lr.fit(X, y)
+y_pred_lr = model_lr.predict(X)
+lr_r2 = r2_score(y, y_pred_lr)
+lr_rmse = np.sqrt(mean_squared_error(y, y_pred_lr))
+
+# ================================
+#  ARIMA
+# ================================
+result = adfuller(df['close'])
+model_arima = ARIMA(df['close'], order=(5,1,0))
+model_arima_fit = model_arima.fit()
+forecast_arima = model_arima_fit.forecast(steps=30)
+arima_forecast = forecast_arima.values[-1]
+arima_last = df['close'].iloc[-1]
+arima_direction = 'up' if arima_forecast > arima_last else 'down'
+
+# ================================
+#  Random Forest
+# ================================
+df['price_change'] = np.where(df['close'].diff() > 0, 1, 0)
+X_rf = df[['open', 'high', 'low', 'volume']]
+y_rf = df['price_change']
+X_train_rf, X_test_rf, y_train_rf, y_test_rf = train_test_split(X_rf, y_rf, test_size=0.2, shuffle=False)
+rf_model = RandomForestClassifier()
+rf_model.fit(X_train_rf, y_train_rf)
+rf_accuracy = rf_model.score(X_test_rf, y_test_rf)
+
+# ================================
+#  LSTM
+# ================================
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(df[['close']])
+def create_sequences(data, seq_length):
+    X, y = [], []
+    for i in range(len(data) - seq_length):
+        X.append(data[i:i+seq_length])
+        y.append(data[i+seq_length])
+    return np.array(X), np.array(y)
+seq_length = 60
+X_lstm, y_lstm = create_sequences(scaled_data, seq_length)
+split = int(0.8 * len(X_lstm))
+X_train_lstm, X_test_lstm = X_lstm[:split], X_lstm[split:]
+y_train_lstm, y_test_lstm = y_lstm[:split], y_lstm[split:]
+model_lstm = Sequential([
+    LSTM(50, return_sequences=True, input_shape=(seq_length, 1)),
+    LSTM(50),
+    Dense(1)
+])
+model_lstm.compile(optimizer='adam', loss='mse')
+model_lstm.fit(X_train_lstm, y_train_lstm, epochs=20, batch_size=32)
+pred_lstm = model_lstm.predict(X_test_lstm)
+pred_lstm = scaler.inverse_transform(pred_lstm)
+y_test_actual = scaler.inverse_transform(y_test_lstm.reshape(-1, 1))
+lstm_rmse = np.sqrt(mean_squared_error(y_test_actual, pred_lstm))
+lstm_direction = 'up' if pred_lstm[-1] > y_test_actual[-1] else 'down'
+
+# ================================
+#  XGBoost
+# ================================
+X_xgb = df[['open', 'high', 'low', 'volume']]
+y_xgb = df['close']
+X_train_xgb, X_test_xgb, y_train_xgb, y_test_xgb = train_test_split(X_xgb, y_xgb, test_size=0.2, shuffle=False)
+xgb_model = XGBRegressor()
+xgb_model.fit(X_train_xgb, y_train_xgb)
+xgb_pred = xgb_model.predict(X_test_xgb)
+xgb_rmse = np.sqrt(mean_squared_error(y_test_xgb, xgb_pred))
+
+# ================================
+#  Prophet
+# ================================
+df_prophet = df[['date', 'close']].rename(columns={'date': 'ds', 'close': 'y'})
+model_prophet = Prophet()
+model_prophet.fit(df_prophet)
+future = model_prophet.make_future_dataframe(periods=30)
+forecast_prophet = model_prophet.predict(future)
+prophet_forecast = forecast_prophet['yhat'].iloc[-1]
+prophet_last = df['close'].iloc[-1]
+prophet_direction = 'up' if prophet_forecast > prophet_last else 'down'
+
+close_col = next((col for col in df.columns if 'close' in col.lower()), None)
+if not close_col:
+    print("Close column not found. Available columns:", df.columns.tolist())
+    exit()
+df.rename(columns={close_col: 'Close'}, inplace=True)
+
+# ================================
+#  CatBoost
+# ================================
+for lag in range(1, 6):
+    df[f'lag_{lag}'] = df['Close'].shift(lag)
+df['rolling_mean_5'] = df['Close'].rolling(window=5).mean()
+df['rolling_std_5'] = df['Close'].rolling(window=5).std()
+
+df.dropna(inplace=True)
+X = df.drop(columns=['Close'])
+y = df['Close']
+
+non_constant_cols = X.columns[X.nunique() > 1]
+if len(non_constant_cols) == 0:
+    print("All features are constant. Injecting dummy feature to proceed.")
+    X['dummy'] = np.random.randn(len(X))
+    non_constant_cols = ['dummy']
+
+X = X[non_constant_cols]
+
+split = int(0.8 * len(X))
+X_train_cb, X_test_cb = X[:split], X[split:]
+y_train_cb, y_test_cb = y[:split], y[split:]
+
+cat_model = CatBoostRegressor(verbose=0)
+cat_model.fit(X_train_cb, y_train_cb)
+cat_pred = cat_model.predict(X_test_cb)
+
+cat_rmse = np.sqrt(mean_squared_error(y_test_cb, cat_pred))
+cat_direction = 'up' if cat_pred[-1] > y_test_cb.iloc[-1] else 'down'
+
+print(f"\nCatBoost RMSE: {cat_rmse:.4f}")
+print(f"CatBoost Direction: {cat_direction}")
+print("Feature variance check:")
+print(X_train_cb.nunique())
+
+# ================================
+#  GRU
+# ================================
+model_gru = Sequential([
+    GRU(50, return_sequences=True, input_shape=(seq_length, 1)),
+    GRU(50),
+    Dense(1)
+])
+model_gru.compile(optimizer='adam', loss='mse')
+model_gru.fit(X_train_lstm, y_train_lstm, epochs=20, batch_size=32)
+gru_pred = model_gru.predict(X_test_lstm)
+gru_pred = scaler.inverse_transform(gru_pred)
+gru_rmse = np.sqrt(mean_squared_error(y_test_actual, gru_pred))
+gru_direction = 'up' if gru_pred[-1] > y_test_actual[-1] else 'down'
+
+xgb_direction = 'up' if xgb_pred[-1] > y_test_xgb.iloc[-1] else 'down'
+
+# ================================
+#  Model Performance Summary
+# ================================
+model_scores = {
+    'Linear Regression': {'rmse': lr_rmse},
+    'ARIMA': {'direction': arima_direction},
+    'Random Forest': {'accuracy': rf_accuracy},
+    'LSTM': {'rmse': lstm_rmse, 'direction': lstm_direction},
+    'XGBoost': {'rmse': xgb_rmse, 'direction': xgb_direction},
+    'Prophet': {'direction': prophet_direction},
+    'CatBoost': {'rmse': cat_rmse, 'direction': cat_direction},
+    'GRU': {'rmse': gru_rmse, 'direction': gru_direction}
+}
+
+print("\nModel Performance Summary:")
+for model, metrics in model_scores.items():
+    print(f"{model}: {metrics}")
+print("\nModel Performance Summary:")
+for model, metrics in model_scores.items():
+    print(f"{model}: {metrics}")
+
+# ================================
+#  Model Selection & Action
+# ================================
+best_model = None
+action = "Hold"
+
+rmse_models = {k: v['rmse'] for k, v in model_scores.items() if 'rmse' in v}
+best_rmse_model = min(rmse_models, key=rmse_models.get)
+best_model = best_rmse_model
+
+direction = model_scores.get(best_model, {}).get('direction', None)
+if direction == 'up':
+    action = "Buy"
+elif direction == 'down':
+    action = "Sell"
+elif model_scores.get(best_model, {}).get('accuracy', 0) > 0.7:
+    action = "Buy"
+elif model_scores.get(best_model, {}).get('accuracy', 0) < 0.5:
+    action = "Sell"
+
+# ================================
+#  Final Output
+# ================================
+print(f"\nBest Performing Model: {best_model}")
+print(f"Suggested Action: {action}")
